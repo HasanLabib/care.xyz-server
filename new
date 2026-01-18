@@ -1,0 +1,132 @@
+const db = client.db("careDB");
+  const users = db.collection("users");
+  const services = db.collection("services");
+  const bookings = db.collection("bookings");
+
+  app.get("/", (req, res) => {
+    res.send("Care.xyz Server Running");
+  });
+
+  app.post("/register", async (req, res) => {
+    const { name, email, password, contact, nid } = req.body;
+
+    if (!email || !password)
+      return res.status(400).json({ message: "Missing fields" });
+
+    const exists = await users.findOne({ email });
+    if (exists) return res.status(409).json({ message: "User already exists" });
+
+    const hashed = await bcrypt.hash(password, 10);
+
+    const user = {
+      name,
+      email,
+      password: hashed,
+      contact,
+      nid,
+      role: "user",
+      createdAt: new Date(),
+    };
+
+    const result = await users.insertOne(user);
+
+    const accessToken = createAccessToken(result.insertedId);
+    const refreshToken = createRefreshToken(result.insertedId);
+
+    res.cookie("accessToken", accessToken, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: "lax",
+    });
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: "lax",
+    });
+
+    res.status(201).json({ message: "Registered successfully" });
+  });
+
+  app.post("/login", async (req, res) => {
+    const { email, password } = req.body;
+
+    const user = await users.findOne({ email });
+    if (!user) return res.status(401).json({ message: "Invalid credentials" });
+
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(401).json({ message: "Invalid credentials" });
+
+    const accessToken = createAccessToken(user._id);
+    const refreshToken = createRefreshToken(user._id);
+
+    res.cookie("accessToken", accessToken, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: "lax",
+    });
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: "lax",
+    });
+
+    res.json({ message: "Login successful" });
+  });
+
+  app.post("/logout", (req, res) => {
+    res.clearCookie("accessToken");
+    res.clearCookie("refreshToken");
+    res.json({ message: "Logged out" });
+  });
+
+  app.get("/me", verifyToken, async (req, res) => {
+    const user = await users.findOne(
+      { _id: new ObjectId(req.userId) },
+      { projection: { password: 0 } },
+    );
+    res.json(user);
+  });
+
+  app.get("/services", async (req, res) => {
+    const result = await services.find().toArray();
+    res.json(result);
+  });
+
+  app.get("/service/:id", async (req, res) => {
+    const service = await services.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+    res.json(service);
+  });
+
+  app.post("/booking", verifyToken, async (req, res) => {
+    const booking = {
+      userId: new ObjectId(req.userId),
+      serviceId: new ObjectId(req.body.serviceId),
+      serviceName: req.body.serviceName,
+      duration: req.body.duration,
+      location: req.body.location,
+      address: req.body.address,
+      totalCost: req.body.totalCost,
+      status: "Pending",
+      createdAt: new Date(),
+    };
+
+    const result = await bookings.insertOne(booking);
+    res.status(201).json({ message: "Booking placed", id: result.insertedId });
+  });
+
+  app.get("/my-bookings", verifyToken, async (req, res) => {
+    const result = await bookings
+      .find({ userId: new ObjectId(req.userId) })
+      .toArray();
+    res.json(result);
+  });
+
+  app.patch("/cancel-booking/:id", verifyToken, async (req, res) => {
+    await bookings.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { status: "Cancelled" } },
+    );
+    res.json({ message: "Booking cancelled" });
+  });
