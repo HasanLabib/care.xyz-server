@@ -11,24 +11,42 @@ const port = process.env.PORT || 5050;
 
 const isProduction = process.env.NODE_ENV === "production";
 
-const ACCESS_SECRET =
-  process.env.JWT_ACCESS_SECRET ||
-  (isProduction ? "production-access-secret-fallback" : "dev-access-secret");
+const ACCESS_SECRET = process.env.JWT_ACCESS_SECRET;
+const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 
-const REFRESH_SECRET =
-  process.env.JWT_REFRESH_SECRET ||
-  (isProduction ? "production-refresh-secret-fallback" : "dev-refresh-secret");
+if (!ACCESS_SECRET || !REFRESH_SECRET) {
+  console.error("JWT secrets missing in .env!");
+  process.exit(1);
+}
 
 app.use(
   cors({
-    origin: isProduction ? ["https://vercel.com"] : true,
+    origin: process.env.CLIENT_URL || "https://care-xyz-client.vercel.app",
     credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS", "PUT"],
+    maxAge: 86400, // 24 hours preflight cache
   }),
 );
 
-app.use(express.json());
+// app.options(
+//   "*",
+//   cors({
+//     origin: "https://care-xyz-client.vercel.app",
+//     credentials: true,
+//     allowedHeaders: ["Content-Type", "Authorization"],
+//     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+//   }),
+// );
+
+app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 app.set("trust proxy", 1);
+
+if (!process.env.MONGOUSER || !process.env.MONGOPASS) {
+  console.error("MongoDB credentials missing in .env!");
+  process.exit(1);
+}
 
 const uri = `mongodb+srv://${process.env.MONGOUSER}:${process.env.MONGOPASS}@programmingheroassignme.7jfqtzz.mongodb.net/?appName=ProgrammingHeroAssignment`;
 const client = new MongoClient(uri, {
@@ -67,16 +85,19 @@ const cookieOptions = isProduction
       httpOnly: true,
       secure: true,
       sameSite: "none",
+      path: "/",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     }
   : {
       httpOnly: true,
       secure: false,
       sameSite: "lax",
+      path: "/",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     };
 
 async function run() {
   try {
-    await client.connect();
     const db = client.db("careDB");
     const users = db.collection("users");
     const services = db.collection("services");
@@ -87,10 +108,18 @@ async function run() {
     app.post("/register", async (req, res) => {
       const { name, email, password, contact, nid } = req.body;
 
-      if (!email || !password)
-        return res.status(400).json({ message: "Missing fields" });
-      if (!ACCESS_SECRET || !REFRESH_SECRET)
-        return res.status(500).json({ message: "Server misconfigured" });
+      // Input validation
+      if (!email || !password || !name)
+        return res.status(400).json({ message: "Name, email, and password are required" });
+      
+      // Email format validation
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email))
+        return res.status(400).json({ message: "Invalid email format" });
+      
+      // Password strength validation
+      if (password.length < 6)
+        return res.status(400).json({ message: "Password must be at least 6 characters long" });
 
       try {
         const exists = await users.findOne({ email });
@@ -127,8 +156,6 @@ async function run() {
       const { email, password } = req.body;
       if (!email || !password)
         return res.status(400).json({ message: "Missing fields" });
-      if (!ACCESS_SECRET || !REFRESH_SECRET)
-        return res.status(500).json({ message: "Server misconfigured" });
 
       try {
         const user = await users.findOne({ email });
@@ -145,7 +172,15 @@ async function run() {
         res.cookie("accessToken", accessToken, cookieOptions);
         res.cookie("refreshToken", refreshToken, cookieOptions);
 
-        res.json({ message: "Login successful" });
+        res.json({
+          message: "Login successful",
+          accessToken,
+          user: {
+            _id: user._id,
+            email: user.email,
+            role: user.role,
+          },
+        });
       } catch (error) {
         console.error("Login error:", error);
         res.status(500).json({ message: "Login failed" });
@@ -156,6 +191,37 @@ async function run() {
       res.clearCookie("accessToken", cookieOptions);
       res.clearCookie("refreshToken", cookieOptions);
       res.json({ message: "Logged out" });
+    });
+
+    app.post("/refresh-token", async (req, res) => {
+      const refreshToken = req.cookies.refreshToken;
+      
+      if (!refreshToken) {
+        return res.status(401).json({ message: "No refresh token provided" });
+      }
+
+      try {
+        const decoded = jwt.verify(refreshToken, REFRESH_SECRET);
+        const user = await users.findOne({ _id: new ObjectId(decoded.id) });
+        
+        if (!user) {
+          return res.status(401).json({ message: "User not found" });
+        }
+
+        const newAccessToken = createAccessToken(user._id);
+        const newRefreshToken = createRefreshToken(user._id);
+
+        res.cookie("accessToken", newAccessToken, cookieOptions);
+        res.cookie("refreshToken", newRefreshToken, cookieOptions);
+
+        res.json({ 
+          message: "Token refreshed",
+          accessToken: newAccessToken 
+        });
+      } catch (error) {
+        console.error("Refresh token error:", error);
+        res.status(401).json({ message: "Invalid refresh token" });
+      }
     });
 
     app.get("/me", verifyToken, async (req, res) => {
@@ -215,18 +281,37 @@ async function run() {
           totalCost,
         } = req.body;
 
+        // Input validation
         if (!serviceId || !ObjectId.isValid(serviceId)) {
           return res.status(400).json({ message: "Invalid service ID" });
+        }
+
+        if (!serviceName || !duration || !location || !address) {
+          return res.status(400).json({ message: "All booking fields are required" });
+        }
+
+        if (isNaN(duration) || duration <= 0) {
+          return res.status(400).json({ message: "Duration must be a positive number" });
+        }
+
+        if (isNaN(totalCost) || totalCost <= 0) {
+          return res.status(400).json({ message: "Total cost must be a positive number" });
+        }
+
+        // Verify service exists
+        const serviceExists = await services.findOne({ _id: new ObjectId(serviceId) });
+        if (!serviceExists) {
+          return res.status(404).json({ message: "Service not found" });
         }
 
         const booking = {
           userId: new ObjectId(req.userId),
           serviceId: new ObjectId(serviceId),
           serviceName,
-          duration,
-          location,
-          address,
-          totalCost,
+          duration: Number(duration),
+          location: location.trim(),
+          address: address.trim(),
+          totalCost: Number(totalCost),
           status: "Pending",
           createdAt: new Date(),
         };
@@ -261,19 +346,33 @@ async function run() {
           return res.status(400).json({ message: "Invalid booking ID" });
         }
 
+        // First check if booking exists and belongs to user
+        const booking = await bookings.findOne({
+          _id: new ObjectId(id),
+          userId: new ObjectId(req.userId),
+        });
+
+        if (!booking) {
+          return res.status(404).json({ message: "Booking not found" });
+        }
+
+        if (booking.status === "Cancelled") {
+          return res.status(400).json({ message: "Booking is already cancelled" });
+        }
+
+        if (booking.status === "Completed") {
+          return res.status(400).json({ message: "Cannot cancel completed booking" });
+        }
+
         const result = await bookings.updateOne(
           {
             _id: new ObjectId(id),
             userId: new ObjectId(req.userId),
           },
-          { $set: { status: "Cancelled" } },
+          { $set: { status: "Cancelled", cancelledAt: new Date() } },
         );
 
-        if (result.matchedCount === 0) {
-          return res.status(404).json({ message: "Booking not found" });
-        }
-
-        res.json({ message: "Booking cancelled" });
+        res.json({ message: "Booking cancelled successfully" });
       } catch (error) {
         console.error("Cancel booking error:", error);
         res.status(500).json({ message: "Failed to cancel booking" });
