@@ -19,29 +19,55 @@ if (!ACCESS_SECRET || !REFRESH_SECRET) {
   process.exit(1);
 }
 
+// Rate limiting middleware (simple implementation)
+const rateLimitMap = new Map();
+
+const rateLimit = (windowMs, maxRequests) => {
+  return (req, res, next) => {
+    const clientIP = req.ip || req.connection.remoteAddress;
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    
+    // Clean old entries
+    if (rateLimitMap.has(clientIP)) {
+      const requests = rateLimitMap.get(clientIP).filter(time => time > windowStart);
+      rateLimitMap.set(clientIP, requests);
+    }
+    
+    const requests = rateLimitMap.get(clientIP) || [];
+    
+    if (requests.length >= maxRequests) {
+      return res.status(429).json({ 
+        message: "Too many requests, please try again later" 
+      });
+    }
+    
+    requests.push(now);
+    rateLimitMap.set(clientIP, requests);
+    next();
+  };
+};
+
+// Rate limiters
+const authLimiter = rateLimit(15 * 60 * 1000, 5); // 5 requests per 15 minutes
+const generalLimiter = rateLimit(15 * 60 * 1000, 100); // 100 requests per 15 minutes
+
 app.use(
   cors({
     origin: process.env.CLIENT_URL || "https://care-xyz-client.vercel.app",
     credentials: true,
     allowedHeaders: ["Content-Type", "Authorization"],
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS", "PUT"],
-    maxAge: 86400, // 24 hours preflight cache
+    maxAge: 86400,
   }),
 );
 
-// app.options(
-//   "*",
-//   cors({
-//     origin: "https://care-xyz-client.vercel.app",
-//     credentials: true,
-//     allowedHeaders: ["Content-Type", "Authorization"],
-//     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-//   }),
-// );
-
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: "10mb" }));
 app.use(cookieParser());
 app.set("trust proxy", 1);
+
+// Apply general rate limiting to all routes
+app.use(generalLimiter);
 
 if (!process.env.MONGOUSER || !process.env.MONGOPASS) {
   console.error("MongoDB credentials missing in .env!");
@@ -86,14 +112,14 @@ const cookieOptions = isProduction
       secure: true,
       sameSite: "none",
       path: "/",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     }
   : {
       httpOnly: true,
       secure: false,
       sameSite: "lax",
       path: "/",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     };
 
 async function run() {
@@ -103,37 +129,85 @@ async function run() {
     const services = db.collection("services");
     const bookings = db.collection("bookings");
 
+    // Create database indexes for performance
+    try {
+      await users.createIndex({ email: 1 }, { unique: true });
+      await bookings.createIndex({ userId: 1 });
+      await bookings.createIndex({ serviceId: 1 });
+      await bookings.createIndex({ createdAt: -1 });
+      console.log("Database indexes created successfully");
+    } catch (indexError) {
+      console.log("Database indexes already exist or creation failed:", indexError.message);
+    }
+
     app.get("/", (req, res) => res.send("Care.xyz Server Running"));
 
-    app.post("/register", async (req, res) => {
+    // Health check endpoint for monitoring
+    app.get("/health", async (req, res) => {
+      try {
+        // Check database connection
+        await client.db("admin").command({ ping: 1 });
+        res.json({ 
+          status: "healthy", 
+          timestamp: new Date().toISOString(),
+          database: "connected",
+          service: "Care.xyz API"
+        });
+      } catch (error) {
+        res.status(503).json({ 
+          status: "unhealthy", 
+          error: error.message,
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    app.post("/register", authLimiter, async (req, res) => {
       const { name, email, password, contact, nid } = req.body;
 
-      // Input validation
+      // Input validation and sanitization
       if (!email || !password || !name)
-        return res.status(400).json({ message: "Name, email, and password are required" });
-      
-      // Email format validation
+        return res
+          .status(400)
+          .json({ message: "Name, email, and password are required" });
+
+      // Sanitize and validate inputs
+      const sanitizedName = name.trim();
+      const sanitizedEmail = email.trim().toLowerCase();
+      const sanitizedContact = contact ? contact.trim() : '';
+      const sanitizedNid = nid ? nid.trim() : '';
+
+      if (!sanitizedName || sanitizedName.length < 2)
+        return res.status(400).json({ message: "Name must be at least 2 characters" });
+
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(email))
+      if (!emailRegex.test(sanitizedEmail))
         return res.status(400).json({ message: "Invalid email format" });
-      
-      // Password strength validation
-      if (password.length < 6)
-        return res.status(400).json({ message: "Password must be at least 6 characters long" });
+
+      if (password.length < 8)
+        return res
+          .status(400)
+          .json({ message: "Password must be at least 8 characters long" });
+
+      // Check password complexity
+      if (!/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(password))
+        return res
+          .status(400)
+          .json({ message: "Password must contain uppercase, lowercase, and number" });
 
       try {
-        const exists = await users.findOne({ email });
+        const exists = await users.findOne({ email: sanitizedEmail });
         if (exists)
           return res.status(409).json({ message: "User already exists" });
 
         const hashed = await bcrypt.hash(password, 10);
 
         const user = {
-          name,
-          email,
+          name: sanitizedName,
+          email: sanitizedEmail,
           password: hashed,
-          contact,
-          nid,
+          contact: sanitizedContact,
+          nid: sanitizedNid,
           role: "user",
           createdAt: new Date(),
         };
@@ -152,7 +226,7 @@ async function run() {
       }
     });
 
-    app.post("/login", async (req, res) => {
+    app.post("/login", authLimiter, async (req, res) => {
       const { email, password } = req.body;
       if (!email || !password)
         return res.status(400).json({ message: "Missing fields" });
@@ -195,7 +269,7 @@ async function run() {
 
     app.post("/refresh-token", async (req, res) => {
       const refreshToken = req.cookies.refreshToken;
-      
+
       if (!refreshToken) {
         return res.status(401).json({ message: "No refresh token provided" });
       }
@@ -203,7 +277,7 @@ async function run() {
       try {
         const decoded = jwt.verify(refreshToken, REFRESH_SECRET);
         const user = await users.findOne({ _id: new ObjectId(decoded.id) });
-        
+
         if (!user) {
           return res.status(401).json({ message: "User not found" });
         }
@@ -214,9 +288,9 @@ async function run() {
         res.cookie("accessToken", newAccessToken, cookieOptions);
         res.cookie("refreshToken", newRefreshToken, cookieOptions);
 
-        res.json({ 
+        res.json({
           message: "Token refreshed",
-          accessToken: newAccessToken 
+          accessToken: newAccessToken,
         });
       } catch (error) {
         console.error("Refresh token error:", error);
@@ -242,8 +316,31 @@ async function run() {
 
     app.get("/services", async (req, res) => {
       try {
-        const result = await services.find().toArray();
-        res.json(result);
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const skip = (page - 1) * limit;
+        
+        const result = await services.find()
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+        
+        const total = await services.countDocuments();
+        
+        // For backward compatibility, return just the array if no pagination requested
+        if (!req.query.page && !req.query.limit) {
+          res.json(result);
+        } else {
+          res.json({
+            services: result,
+            pagination: {
+              page,
+              limit,
+              total,
+              pages: Math.ceil(total / limit)
+            }
+          });
+        }
       } catch (error) {
         console.error("Get services error:", error);
         res.status(500).json({ message: "Failed to fetch services" });
@@ -281,36 +378,56 @@ async function run() {
           totalCost,
         } = req.body;
 
-        // Input validation
         if (!serviceId || !ObjectId.isValid(serviceId)) {
           return res.status(400).json({ message: "Invalid service ID" });
         }
 
-        if (!serviceName || !duration || !location || !address) {
-          return res.status(400).json({ message: "All booking fields are required" });
+        // Sanitize and validate inputs
+        const sanitizedServiceName = serviceName ? serviceName.trim() : '';
+        const sanitizedLocation = location ? location.trim() : '';
+        const sanitizedAddress = address ? address.trim() : '';
+
+        if (!sanitizedServiceName || !duration || !sanitizedLocation || !sanitizedAddress) {
+          return res
+            .status(400)
+            .json({ message: "All booking fields are required" });
         }
 
-        if (isNaN(duration) || duration <= 0) {
-          return res.status(400).json({ message: "Duration must be a positive number" });
+        if (isNaN(duration) || duration <= 0 || duration > 365) {
+          return res
+            .status(400)
+            .json({ message: "Duration must be between 1 and 365 days" });
         }
 
         if (isNaN(totalCost) || totalCost <= 0) {
-          return res.status(400).json({ message: "Total cost must be a positive number" });
+          return res
+            .status(400)
+            .json({ message: "Total cost must be a positive number" });
         }
 
-        // Verify service exists
-        const serviceExists = await services.findOne({ _id: new ObjectId(serviceId) });
+        // Re-fetch service to validate current price and availability
+        const serviceExists = await services.findOne({
+          _id: new ObjectId(serviceId),
+        });
         if (!serviceExists) {
           return res.status(404).json({ message: "Service not found" });
+        }
+
+        // Validate cost calculation server-side
+        const expectedCost = serviceExists.price * Number(duration);
+        if (Math.abs(expectedCost - Number(totalCost)) > 0.01) {
+          return res.status(400).json({ 
+            message: "Cost calculation mismatch. Please refresh and try again." 
+          });
         }
 
         const booking = {
           userId: new ObjectId(req.userId),
           serviceId: new ObjectId(serviceId),
-          serviceName,
+          serviceName: sanitizedServiceName,
           duration: Number(duration),
-          location: location.trim(),
-          address: address.trim(),
+          location: sanitizedLocation,
+          address: sanitizedAddress,
           totalCost: Number(totalCost),
           status: "Pending",
           createdAt: new Date(),
@@ -346,7 +463,6 @@ async function run() {
           return res.status(400).json({ message: "Invalid booking ID" });
         }
 
-        // First check if booking exists and belongs to user
         const booking = await bookings.findOne({
           _id: new ObjectId(id),
           userId: new ObjectId(req.userId),
@@ -357,11 +473,15 @@ async function run() {
         }
 
         if (booking.status === "Cancelled") {
-          return res.status(400).json({ message: "Booking is already cancelled" });
+          return res
+            .status(400)
+            .json({ message: "Booking is already cancelled" });
         }
 
         if (booking.status === "Completed") {
-          return res.status(400).json({ message: "Cannot cancel completed booking" });
+          return res
+            .status(400)
+            .json({ message: "Cannot cancel completed booking" });
         }
 
         const result = await bookings.updateOne(
