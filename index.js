@@ -15,7 +15,9 @@ const ACCESS_SECRET = process.env.JWT_ACCESS_SECRET;
 const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 
 if (!ACCESS_SECRET || !REFRESH_SECRET) {
-  console.error("JWT secrets missing in .env!");
+  console.error("JWT secrets missing in environment variables!");
+  console.error("ACCESS_SECRET:", ACCESS_SECRET ? 'SET' : 'NOT_SET');
+  console.error("REFRESH_SECRET:", REFRESH_SECRET ? 'SET' : 'NOT_SET');
   process.exit(1);
 }
 
@@ -70,7 +72,9 @@ app.set("trust proxy", 1);
 app.use(generalLimiter);
 
 if (!process.env.MONGOUSER || !process.env.MONGOPASS) {
-  console.error("MongoDB credentials missing in .env!");
+  console.error("MongoDB credentials missing in environment variables!");
+  console.error("MONGOUSER:", process.env.MONGOUSER ? 'SET' : 'NOT_SET');
+  console.error("MONGOPASS:", process.env.MONGOPASS ? 'SET' : 'NOT_SET');
   process.exit(1);
 }
 
@@ -124,6 +128,13 @@ const cookieOptions = isProduction
 
 async function run() {
   try {
+    // Connect to MongoDB - REQUIRED for server to start
+    await client.connect();
+    
+    // Test database connection
+    await client.db("admin").command({ ping: 1 });
+    console.log("MongoDB Connected Successfully");
+
     const db = client.db("careDB");
     const users = db.collection("users");
     const services = db.collection("services");
@@ -140,7 +151,41 @@ async function run() {
       console.log("Database indexes already exist or creation failed:", indexError.message);
     }
 
-    app.get("/", (req, res) => res.send("Care.xyz Server Running"));
+    // DEFINE ALL ROUTES AFTER SUCCESSFUL DATABASE CONNECTION
+
+    // Root endpoint
+    app.get("/", (req, res) => {
+      res.json({
+        message: "Care.xyz Server Running",
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development',
+        status: "healthy",
+        database: "connected"
+      });
+    });
+
+    // Environment check endpoint for debugging
+    app.get("/env-check", (req, res) => {
+      res.json({
+        NODE_ENV: process.env.NODE_ENV || 'NOT_SET',
+        PORT: process.env.PORT || 'NOT_SET',
+        MONGOUSER: process.env.MONGOUSER ? 'SET' : 'NOT_SET',
+        MONGOPASS: process.env.MONGOPASS ? 'SET' : 'NOT_SET',
+        JWT_ACCESS_SECRET: process.env.JWT_ACCESS_SECRET ? 'SET' : 'NOT_SET',
+        JWT_REFRESH_SECRET: process.env.JWT_REFRESH_SECRET ? 'SET' : 'NOT_SET',
+        CLIENT_URL: process.env.CLIENT_URL || 'NOT_SET',
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    // Database status endpoint
+    app.get("/db-status", (req, res) => {
+      res.json({
+        status: "connected",
+        database: "careDB",
+        timestamp: new Date().toISOString()
+      });
+    });
 
     // Health check endpoint for monitoring
     app.get("/health", async (req, res) => {
@@ -163,39 +208,39 @@ async function run() {
     });
 
     app.post("/register", authLimiter, async (req, res) => {
-      const { name, email, password, contact, nid } = req.body;
-
-      // Input validation and sanitization
-      if (!email || !password || !name)
-        return res
-          .status(400)
-          .json({ message: "Name, email, and password are required" });
-
-      // Sanitize and validate inputs
-      const sanitizedName = name.trim();
-      const sanitizedEmail = email.trim().toLowerCase();
-      const sanitizedContact = contact ? contact.trim() : '';
-      const sanitizedNid = nid ? nid.trim() : '';
-
-      if (!sanitizedName || sanitizedName.length < 2)
-        return res.status(400).json({ message: "Name must be at least 2 characters" });
-
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(sanitizedEmail))
-        return res.status(400).json({ message: "Invalid email format" });
-
-      if (password.length < 8)
-        return res
-          .status(400)
-          .json({ message: "Password must be at least 8 characters long" });
-
-      // Check password complexity
-      if (!/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(password))
-        return res
-          .status(400)
-          .json({ message: "Password must contain uppercase, lowercase, and number" });
-
       try {
+        const { name, email, password, contact, nid } = req.body;
+
+        // Input validation and sanitization
+        if (!email || !password || !name)
+          return res
+            .status(400)
+            .json({ message: "Name, email, and password are required" });
+
+        // Sanitize and validate inputs
+        const sanitizedName = name.trim();
+        const sanitizedEmail = email.trim().toLowerCase();
+        const sanitizedContact = contact ? contact.trim() : '';
+        const sanitizedNid = nid ? nid.trim() : '';
+
+        if (!sanitizedName || sanitizedName.length < 2)
+          return res.status(400).json({ message: "Name must be at least 2 characters" });
+
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(sanitizedEmail))
+          return res.status(400).json({ message: "Invalid email format" });
+
+        if (password.length < 8)
+          return res
+            .status(400)
+            .json({ message: "Password must be at least 8 characters long" });
+
+        // Check password complexity
+        if (!/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(password))
+          return res
+            .status(400)
+            .json({ message: "Password must contain uppercase, lowercase, and number" });
+
         const exists = await users.findOne({ email: sanitizedEmail });
         if (exists)
           return res.status(409).json({ message: "User already exists" });
@@ -227,11 +272,11 @@ async function run() {
     });
 
     app.post("/login", authLimiter, async (req, res) => {
-      const { email, password } = req.body;
-      if (!email || !password)
-        return res.status(400).json({ message: "Missing fields" });
-
       try {
+        const { email, password } = req.body;
+        if (!email || !password)
+          return res.status(400).json({ message: "Missing fields" });
+
         const user = await users.findOne({ email });
         if (!user)
           return res.status(401).json({ message: "Invalid credentials" });
@@ -268,13 +313,13 @@ async function run() {
     });
 
     app.post("/refresh-token", async (req, res) => {
-      const refreshToken = req.cookies.refreshToken;
-
-      if (!refreshToken) {
-        return res.status(401).json({ message: "No refresh token provided" });
-      }
-
       try {
+        const refreshToken = req.cookies.refreshToken;
+
+        if (!refreshToken) {
+          return res.status(401).json({ message: "No refresh token provided" });
+        }
+
         const decoded = jwt.verify(refreshToken, REFRESH_SECRET);
         const user = await users.findOne({ _id: new ObjectId(decoded.id) });
 
@@ -499,12 +544,24 @@ async function run() {
       }
     });
 
-    console.log("MongoDB Connected");
+    // Start the server ONLY after successful database connection
+    app.listen(port, () => {
+      console.log(`Care.xyz server running on port ${port}`);
+      console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`Database: Connected to careDB`);
+      console.log(`MongoDB User: ${process.env.MONGOUSER ? 'SET' : 'NOT_SET'}`);
+      console.log(`JWT Secrets: ${process.env.JWT_ACCESS_SECRET ? 'SET' : 'NOT_SET'}`);
+    });
+
+    console.log("MongoDB Connected and Server Started");
   } catch (error) {
     console.error("Database connection error:", error);
+    console.error("Server will not start without database connection");
+    process.exit(1);
   }
 }
 
-run().catch(console.error);
-
-app.listen(port, () => console.log(`Care.xyz server running on port ${port}`));
+run().catch((error) => {
+  console.error("Server initialization error:", error);
+  process.exit(1);
+});
